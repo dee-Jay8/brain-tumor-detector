@@ -1,5 +1,5 @@
+import json
 import os
-import inspect
 import numpy as np
 import streamlit as st
 import tensorflow as tf
@@ -7,25 +7,85 @@ from PIL import Image, ImageOps
 
 st.set_page_config(page_title="Brain MRI Tumor Classifier", layout="wide")
 
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bestmodel_lite.keras")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMG_SIZE = (224, 224)
+
+LABEL_DISPLAY = {
+    "glioma": "Glioma",
+    "meningioma": "Meningioma",
+    "notumor": "No Tumor",
+    "pituitary": "Pituitary Tumor",
+}
+
+
+def resolve_model_path() -> str:
+    for name in ("bestmodel_lite.keras", "best_brain_mri_model.keras", "bestmodel.keras"):
+        candidate = os.path.join(BASE_DIR, name)
+        if os.path.exists(candidate):
+            return candidate
+    raise FileNotFoundError("No .keras model file found in the repository root.")
+
+
+def load_class_names(num_outputs: int) -> list[str]:
+    classes_path = os.path.join(BASE_DIR, "class_names.json")
+    if os.path.exists(classes_path):
+        with open(classes_path, "r", encoding="utf-8") as f:
+            names = json.load(f)
+            if len(names) == num_outputs:
+                return names
+    if num_outputs == 4:
+        return ["glioma", "meningioma", "notumor", "pituitary"]
+    return [f"Class {i}" for i in range(num_outputs)]
 
 
 # ==============================================================================
-# 1. LOAD MODEL ONCE (CACHED IN MEMORY)
+# 1. LOAD MODEL & BUILD GRAPH-SAFE GRAD-CAM MODEL ONCE
 # ==============================================================================
 @st.cache_resource
 def load_cnn_model():
-    model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+    model_path = resolve_model_path()
+    model = tf.keras.models.load_model(model_path, compile=False)
+
     last_conv = next(
         layer.name
         for layer in reversed(model.layers)
         if isinstance(layer, tf.keras.layers.Conv2D)
     )
-    return model, last_conv
+
+    # Use a Functional graph so skip/merge layers (Add, Multiply, etc.) execute properly
+    if isinstance(model, tf.keras.Sequential):
+        inp = tf.keras.Input(shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
+        x = inp
+        conv_out = None
+        for layer in model.layers:
+            x = layer(x)
+            if layer.name == last_conv:
+                conv_out = x
+        grad_model = tf.keras.Model(inputs=inp, outputs=[conv_out, x, x])
+    else:
+        layer_names = [layer.name for layer in model.layers]
+        score_tensor = (
+            model.get_layer("logits").output
+            if "logits" in layer_names
+            else model.outputs[0]
+        )
+        grad_model = tf.keras.Model(
+            inputs=model.inputs,
+            outputs=[
+                model.get_layer(last_conv).output,
+                score_tensor,
+                model.outputs[0],
+            ],
+        )
+
+    # EfficientNet models include an internal Rescaling layer and expect [0, 255] inputs
+    has_internal_rescaling = any(
+        isinstance(layer, tf.keras.layers.Rescaling) for layer in model.layers
+    )
+    return model, grad_model, last_conv, has_internal_rescaling
 
 
-model, LAST_CONV_LAYER = load_cnn_model()
+model, grad_model, LAST_CONV_LAYER, HAS_INTERNAL_RESCALING = load_cnn_model()
 
 
 # ==============================================================================
@@ -55,7 +115,9 @@ def auto_crop_brain(pil_img: Image.Image) -> Image.Image:
 def preprocess_image(pil_img: Image.Image, crop_borders: bool) -> tuple[Image.Image, np.ndarray]:
     img = auto_crop_brain(pil_img) if crop_borders else pil_img.convert("RGB")
     resized = img.resize(IMG_SIZE, Image.Resampling.BILINEAR)
-    arr = np.asarray(resized, dtype=np.float32) / 255.0
+    arr = np.asarray(resized, dtype=np.float32)
+    if not HAS_INTERNAL_RESCALING:
+        arr = arr / 255.0
     return resized, np.expand_dims(arr, axis=0)
 
 
@@ -68,39 +130,29 @@ def apply_jet_colormap(heatmap_01: np.ndarray) -> np.ndarray:
 
 def predict_with_gradcam(resized_pil: Image.Image, input_tensor: np.ndarray, overlay_strength: float):
     img_tf = tf.convert_to_tensor(input_tensor)
-    last_layer = model.layers[-1]
 
     with tf.GradientTape() as tape:
-        x = img_tf
-        conv_outputs = None
-        for layer in model.layers[:-1]:
-            if isinstance(layer, tf.keras.layers.InputLayer):
-                continue
-            if "training" in inspect.signature(layer.call).parameters:
-                x = layer(x, training=False)
-            else:
-                x = layer(x)
-            if layer.name == LAST_CONV_LAYER:
-                conv_outputs = x
-                tape.watch(conv_outputs)
-
-        if isinstance(last_layer, tf.keras.layers.Dense):
-            logits = tf.matmul(x, tf.convert_to_tensor(last_layer.kernel)) + tf.convert_to_tensor(last_layer.bias)
-            predictions = last_layer.activation(logits)
-            target_score = logits[:, 0]
+        tape.watch(img_tf)
+        conv_outputs, scores, predictions = grad_model(img_tf, training=False)
+        num_outputs = int(predictions.shape[-1])
+        if num_outputs == 1:
+            target_score = scores[:, 0]
         else:
-            predictions = last_layer(x)
-            target_score = predictions[:, 0]
+            top_idx = int(tf.argmax(predictions[0]))
+            target_score = scores[:, top_idx]
 
     grads = tape.gradient(target_score, conv_outputs)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-    heatmap = tf.maximum(tf.squeeze(conv_outputs[0] @ pooled_grads[..., tf.newaxis]), 0)
+    if grads is None:
+        heatmap_np = np.zeros(conv_outputs.shape[1:3], dtype=np.float32)
+    else:
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+        heatmap = tf.maximum(tf.squeeze(conv_outputs[0] @ pooled_grads[..., tf.newaxis]), 0)
+        max_val = float(tf.reduce_max(heatmap))
+        if max_val > 0:
+            heatmap = heatmap / max_val
+        heatmap_np = heatmap.numpy()
 
-    max_val = float(tf.reduce_max(heatmap))
-    if max_val > 0:
-        heatmap = heatmap / max_val
-
-    heatmap_uint8 = (heatmap.numpy() * 255.0).astype(np.uint8)
+    heatmap_uint8 = (heatmap_np * 255.0).astype(np.uint8)
     heatmap_resized = (
         np.asarray(Image.fromarray(heatmap_uint8).resize(IMG_SIZE, Image.Resampling.BILINEAR), dtype=np.float32)
         / 255.0
@@ -111,13 +163,14 @@ def predict_with_gradcam(resized_pil: Image.Image, input_tensor: np.ndarray, ove
     alpha = (heatmap_resized[..., np.newaxis] ** 0.85) * 0.65 * overlay_strength
     blended = np.clip(orig_rgb * (1.0 - alpha) + jet_rgb * alpha, 0, 255).astype(np.uint8)
 
-    return float(predictions[0][0]), Image.fromarray(blended)
+    return predictions[0].numpy(), Image.fromarray(blended)
+
 
 # ==============================================================================
 # 3. FRONTEND UI
 # ==============================================================================
 st.title("Brain MRI Tumor Classifier")
-st.caption("CNN Binary Classification (224×224 RGB) with Grad-CAM Attention")
+st.caption("CNN MRI Classification (224×224 RGB) with Grad-CAM Attention")
 
 left_col, right_col = st.columns([1, 1.3], gap="large")
 
@@ -136,28 +189,57 @@ with right_col:
     else:
         with st.spinner("Running CNN inference & Grad-CAM..."):
             resized_pil, tensor = preprocess_image(raw_img, crop_borders)
-            raw_score, overlay_img = predict_with_gradcam(resized_pil, tensor, overlay_strength)
+            preds, overlay_img = predict_with_gradcam(resized_pil, tensor, overlay_strength)
 
-        tumor_prob = raw_score
-        no_tumor_prob = 1.0 - raw_score
-        is_tumor = tumor_prob >= 0.5
-        confidence = (tumor_prob if is_tumor else no_tumor_prob) * 100
+        if len(preds) == 1:
+            raw_score = float(preds[0])
+            tumor_prob = raw_score
+            no_tumor_prob = 1.0 - raw_score
+            is_tumor = tumor_prob >= 0.5
+            confidence = (tumor_prob if is_tumor else no_tumor_prob) * 100
 
-        if is_tumor:
-            st.error(f"**Tumor Detected** — {confidence:.2f}% confidence")
+            if is_tumor:
+                st.error(f"**Tumor Detected** — {confidence:.2f}% confidence")
+            else:
+                st.success(f"**No Tumor** — {confidence:.2f}% confidence")
+
+            img_c1, img_c2 = st.columns(2)
+            with img_c1:
+                st.image(resized_pil, caption="Model Input (224×224)", use_container_width=True)
+            with img_c2:
+                st.image(overlay_img, caption=f"Grad-CAM ({LAST_CONV_LAYER})", use_container_width=True)
+
+            st.write(f"**Tumor:** {tumor_prob * 100:.2f}%")
+            st.progress(min(max(tumor_prob, 0.0), 1.0))
+
+            st.write(f"**No Tumor:** {no_tumor_prob * 100:.2f}%")
+            st.progress(min(max(no_tumor_prob, 0.0), 1.0))
+
+            st.caption(f"Layer: `{LAST_CONV_LAYER}` · Raw Sigmoid: `{raw_score:.6f}` · Educational prototype only.")
         else:
-            st.success(f"**No Tumor** — {confidence:.2f}% confidence")
+            class_names = load_class_names(len(preds))
+            top_idx = int(np.argmax(preds))
+            top_key = class_names[top_idx]
+            top_label = LABEL_DISPLAY.get(top_key.lower(), top_key.title())
+            has_tumor = top_key.lower() != "notumor"
+            confidence = float(preds[top_idx]) * 100
 
-        img_c1, img_c2 = st.columns(2)
-        with img_c1:
-            st.image(resized_pil, caption="Model Input (224×224)", use_container_width=True)
-        with img_c2:
-            st.image(overlay_img, caption=f"Grad-CAM ({LAST_CONV_LAYER})", use_container_width=True)
+            if has_tumor:
+                st.error(f"**Tumor Detected · {top_label}** — {confidence:.2f}% confidence")
+            else:
+                st.success(f"**No Tumor** — {confidence:.2f}% confidence")
 
-        st.write(f"**Tumor:** {tumor_prob * 100:.2f}%")
-        st.progress(min(max(tumor_prob, 0.0), 1.0))
+            img_c1, img_c2 = st.columns(2)
+            with img_c1:
+                st.image(resized_pil, caption="Model Input (224×224)", use_container_width=True)
+            with img_c2:
+                st.image(overlay_img, caption=f"Grad-CAM ({LAST_CONV_LAYER})", use_container_width=True)
 
-        st.write(f"**No Tumor:** {no_tumor_prob * 100:.2f}%")
-        st.progress(min(max(no_tumor_prob, 0.0), 1.0))
+            ranked = sorted(zip(class_names, preds), key=lambda item: float(item[1]), reverse=True)
+            for name, prob in ranked:
+                display = LABEL_DISPLAY.get(name.lower(), name.title())
+                p = float(prob)
+                st.write(f"**{display}:** {p * 100:.2f}%")
+                st.progress(min(max(p, 0.0), 1.0))
 
-        st.caption(f"Layer: `{LAST_CONV_LAYER}` · Raw Sigmoid: `{raw_score:.6f}` · Educational prototype only.")
+            st.caption(f"Layer: `{LAST_CONV_LAYER}` · Educational prototype only.")
