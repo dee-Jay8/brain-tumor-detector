@@ -1,4 +1,5 @@
 import os
+import inspect
 import numpy as np
 import streamlit as st
 import tensorflow as tf
@@ -73,16 +74,22 @@ def predict_with_gradcam(resized_pil: Image.Image, input_tensor: np.ndarray, ove
         x = img_tf
         conv_outputs = None
         for layer in model.layers[:-1]:
-            x = layer(x, training=False)
+            if isinstance(layer, tf.keras.layers.InputLayer):
+                continue
+            if "training" in inspect.signature(layer.call).parameters:
+                x = layer(x, training=False)
+            else:
+                x = layer(x)
             if layer.name == LAST_CONV_LAYER:
                 conv_outputs = x
+                tape.watch(conv_outputs)
 
         if isinstance(last_layer, tf.keras.layers.Dense):
-            logits = tf.matmul(x, last_layer.kernel) + last_layer.bias
+            logits = tf.matmul(x, tf.convert_to_tensor(last_layer.kernel)) + tf.convert_to_tensor(last_layer.bias)
             predictions = last_layer.activation(logits)
             target_score = logits[:, 0]
         else:
-            predictions = last_layer(x, training=False)
+            predictions = last_layer(x)
             target_score = predictions[:, 0]
 
     grads = tape.gradient(target_score, conv_outputs)
@@ -105,7 +112,6 @@ def predict_with_gradcam(resized_pil: Image.Image, input_tensor: np.ndarray, ove
     blended = np.clip(orig_rgb * (1.0 - alpha) + jet_rgb * alpha, 0, 255).astype(np.uint8)
 
     return float(predictions[0][0]), Image.fromarray(blended)
-
 
 # ==============================================================================
 # 3. FRONTEND UI
